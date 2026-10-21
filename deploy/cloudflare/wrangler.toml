@@ -1,0 +1,107 @@
+# Cloudflare Worker + Container fronting the Google Workspace MCP server.
+#
+# Public URL:  https://mcp.wmtech.app/wit/google
+# MCP endpoint: https://mcp.wmtech.app/wit/google/mcp
+#
+# Deploy from this directory:  npx wrangler deploy
+# Secrets are set with `npx wrangler secret put <NAME>` — see .env.example.
+
+name = "google-workspace-mcp"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+account_id = "96babd37b2ba5b94d1db0cf34def7f43"   # The Solution Tailor
+workers_dev = false
+
+# Same two-route pattern as the other mcp.wmtech.app connectors, plus the
+# RFC 8414 path-aware authorization-server metadata routes, which this server
+# needs because it is its own OAuth authorization server (the Duo-based
+# connectors advertise a different issuer and don't need them).
+routes = [
+  { pattern = "mcp.wmtech.app/wit/google*", zone_name = "wmtech.app" },
+  { pattern = "mcp.wmtech.app/.well-known/oauth-protected-resource/wit/google*", zone_name = "wmtech.app" },
+  { pattern = "mcp.wmtech.app/.well-known/oauth-authorization-server/wit/google*", zone_name = "wmtech.app" },
+  { pattern = "mcp.wmtech.app/.well-known/openid-configuration/wit/google*", zone_name = "wmtech.app" },
+]
+
+[[containers]]
+class_name = "WorkspaceMcp"
+# Image built from the repo Dockerfile by .github/workflows/cloudflare-image.yml
+# and pushed to the Cloudflare registry. Bump the tag here to roll a release.
+#
+# To build locally instead (needs Docker running):  image = "../../Dockerfile"
+image = "registry.cloudflare.com/96babd37b2ba5b94d1db0cf34def7f43/workspace-mcp:v2.1.1"
+instance_type = "basic"      # 1/4 vCPU, 1 GiB RAM, 4 GB disk. Move to "standard-1" if it swaps.
+max_instances = 1            # Single shared instance; sessions are in-process.
+
+[[durable_objects.bindings]]
+name = "WORKSPACE_MCP"
+class_name = "WorkspaceMcp"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkspaceMcp"]
+
+[observability]
+enabled = true
+
+# ---------------------------------------------------------------------------
+# Non-secret configuration. Everything here is handed to the container as
+# environment variables by src/index.ts. Secrets (client ID/secret, signing
+# key, Valkey password) are NOT here — see .env.example.
+# ---------------------------------------------------------------------------
+[vars]
+# Where this connector lives on the shared host. The Worker strips this prefix
+# before handing requests to the container.
+CONNECTOR_PREFIX = "/wit/google"
+
+# --- URL the server advertises to clients (must match CONNECTOR_PREFIX) ---
+WORKSPACE_EXTERNAL_URL = "https://mcp.wmtech.app/wit/google"
+GOOGLE_OAUTH_REDIRECT_URI = "https://mcp.wmtech.app/wit/google/oauth2callback"
+WORKSPACE_MCP_ALLOWED_HOSTS = "mcp.wmtech.app"
+
+# --- Auth mode ---
+MCP_ENABLE_OAUTH21 = "true"
+WORKSPACE_MCP_STATELESS_MODE = "true"
+WORKSPACE_MCP_DISABLE_LOCAL_FILES = "true"
+OAUTH2_ENABLE_LEGACY_AUTH = "false"
+# Only Claude's MCP OAuth callbacks may be registered by dynamic clients.
+WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS = "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback"
+# Show the proxy consent screen once per browser per client, not every time.
+WORKSPACE_MCP_OAUTH_PROXY_REQUIRE_CONSENT = "remember"
+# Claude Code's CLI flow is known to send Origin: null on the consent POST.
+WORKSPACE_MCP_ALLOW_NULL_ORIGIN_CONSENT = "true"
+
+# --- Token lifetimes (seconds) ---
+WORKSPACE_MCP_OAUTH_PROXY_TOKEN_EXPIRY_THRESHOLD_SECONDS = "60"
+WORKSPACE_MCP_OAUTH_PROXY_ACCESS_TOKEN_EXPIRY_SECONDS = "86400"      # 24 h
+WORKSPACE_MCP_OAUTH_PROXY_REFRESH_TOKEN_EXPIRY_SECONDS = "2592000"   # 30 days, then re-login
+
+# --- OAuth proxy state: Valkey/Redis so logins survive container restarts ---
+WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND = "valkey"
+WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST = "REPLACE-ME.upstash.io"
+WORKSPACE_MCP_OAUTH_PROXY_VALKEY_PORT = "6379"
+WORKSPACE_MCP_OAUTH_PROXY_VALKEY_USE_TLS = "true"
+WORKSPACE_MCP_OAUTH_PROXY_VALKEY_USERNAME = "default"
+WORKSPACE_MCP_OAUTH_PROXY_VALKEY_DB = "0"
+
+# --- Tool surface: start narrow, widen per tenant later ---
+TOOL_TIER = "core"
+WORKSPACE_MCP_READ_ONLY = "true"
+# Uncomment to limit services: TOOLS = "gmail drive calendar docs sheets"
+
+# --- Resource ceilings for a 1 GiB container ---
+WORKSPACE_MCP_MAX_FILE_BYTES = "20971520"              # 20 MiB
+WORKSPACE_MCP_STATELESS_INLINE_MAX_BYTES = "5242880"   # 5 MiB inline, else Drive link
+WORKSPACE_MCP_GOOGLE_API_WORKERS = "16"
+WORKSPACE_MCP_LOG_LEVEL = "INFO"
+
+# --- Consent page branding ---
+WORKSPACE_MCP_BRAND_NAME = "Watchman IT – Google Workspace"
+WORKSPACE_MCP_BRAND_WEBSITE_URL = "https://watchmanit.com"
+
+# Container runtime
+PORT = "8000"
+
+# Source ranges allowed to reach /mcp, /token, /register and the discovery
+# documents (comma-separated IPv4 CIDRs). Default is claude.ai's egress range.
+ALLOWED_CIDRS = "160.79.104.0/21"
